@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -355,8 +356,14 @@ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # that execute their argument make the parenthesized path an executable-script reference.
 _SCRIPT_EXECUTION_CALL_NAMES = frozenset({
     "system", "popen", "run", "call", "Popen", "check_call", "check_output",
-    "getoutput", "getstatusoutput", "exec", "eval",
+    "getoutput", "getstatusoutput", "exec", "eval", "require", "load", "run_path",
+    "create_subprocess_exec", "create_subprocess_shell", "posix_spawn", "posix_spawnp",
+    "startfile",
 })
+_PATH_CONSTRUCTOR_CALL_NAMES = frozenset({"Path", "PurePath", "PosixPath", "WindowsPath"})
+_INERT_DATA_CALL_NAMES = _PATH_CONSTRUCTOR_CALL_NAMES | {"open"}
+_CALLABLE_TOKEN = re.compile(r"^(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*$")
+_SCRIPT_INTERPRETER_NAME = re.compile(r"^(?:pythonw?(?:\d+(?:\.\d+)*)?|node|ruby|perl)$", re.I)
 _SHELL_COMPOUND_PREFIXES = frozenset({
     "if", "while", "until", "!", "then", "else", "elif", "do", "time", "coproc", "{",
     "function",
@@ -949,16 +956,19 @@ def _iter_script_execution_segments(command: str) -> Iterator[list[str]]:
         yield from _script_execution_segments_from_tokens(tokens)
 
 
-def _is_script_execution_call(token: str) -> bool:
-    """Conservatively recognize Python APIs whose call arguments can become executed code."""
+def _call_opens_executable_context(token: str) -> Optional[bool]:
+    """Classify a source-language call boundary.
+
+    Unknown calls stay fail-closed because they may be aliases for an execution API. Only path
+    constructors are proven inert here; matching name prefixes (``run*``/``*spawn*``) both missed
+    aliases and treated unrelated calls such as ``runtime_config`` as execution.
+    """
     name = token.rsplit(".", 1)[-1]
-    return (
-        name in _SCRIPT_EXECUTION_CALL_NAMES
-        or name.startswith(("run", "exec"))
-        or "spawn" in name
-        or name == "startfile"
-        or "subprocess" in name
-    )
+    if name in _INERT_DATA_CALL_NAMES:
+        return False
+    if _CALLABLE_TOKEN.fullmatch(token):
+        return True
+    return None
 
 
 def _script_execution_segments_from_tokens(tokens: list[str]) -> Iterator[list[str]]:
@@ -973,13 +983,16 @@ def _script_execution_segments_from_tokens(tokens: list[str]) -> Iterator[list[s
                 elif control == "(":
                     previous_name = previous_segment[-1] if previous_segment else ""
                     previous_command = previous_segment[0] if previous_segment else ""
-                    command_position = (
-                        command_position
-                        or (execution_parentheses[-1] if execution_parentheses else False)
-                        or previous_name.endswith(("$", "<", ">", "`"))
-                        or _is_script_execution_call(previous_name)
-                        or previous_command in _SHELL_COMPOUND_PREFIXES
-                    )
+                    call_context = _call_opens_executable_context(previous_name)
+                    if call_context is not None:
+                        command_position = call_context
+                    else:
+                        command_position = (
+                            command_position
+                            or (execution_parentheses[-1] if execution_parentheses else False)
+                            or previous_name.endswith(("$", "<", ">", "`"))
+                            or previous_command in _SHELL_COMPOUND_PREFIXES
+                        )
                     execution_parentheses.append(command_position)
                 elif control == ")":
                     if execution_parentheses:
@@ -995,10 +1008,94 @@ def _script_execution_segments_from_tokens(tokens: list[str]) -> Iterator[list[s
         command_position = False
 
 
+def _literal_call_path(node: ast.AST, *, allow_path_constructor: bool) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if (
+        allow_path_constructor
+        and isinstance(node, ast.Call)
+        and node.args
+        and isinstance(node.func, (ast.Name, ast.Attribute))
+    ):
+        name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+        if name in _PATH_CONSTRUCTOR_CALL_NAMES:
+            return _literal_call_path(node.args[0], allow_path_constructor=False)
+    return None
+
+
+def _iter_call_argv_paths(call: ast.Call, *, allow_path_constructor: bool = True) -> Iterator[str]:
+    """Yield only argv entries that execution semantics can interpret as scripts."""
+    if not call.args:
+        return
+    command = call.args[0]
+    direct = _literal_call_path(command, allow_path_constructor=allow_path_constructor)
+    if direct is not None:
+        yield direct
+        return
+    if not isinstance(command, (ast.List, ast.Tuple)) or not command.elts:
+        return
+    argv = [_literal_call_path(item, allow_path_constructor=False) for item in command.elts]
+    executable = argv[0]
+    if executable is None:
+        return
+    if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+        yield executable
+    name = _executable_name(executable)
+    if name in _SHELL_EXECUTABLES or _SCRIPT_INTERPRETER_NAME.fullmatch(name):
+        for argument in argv[1:]:
+            if argument is None:
+                return
+            if argument == "--":
+                continue
+            if argument.startswith("-"):
+                continue
+            yield argument
+            return
+
+
+def _iter_source_call_script_paths(command: str, *, cwd: Optional[str]) -> Iterator[Path]:
+    """Model executable argument positions in Python/JavaScript-shaped call expressions.
+
+    Each physical line is parsed independently because interpreter heredoc framing is shell, not
+    Python. JavaScript ``require('x')``/``load('x')`` and ordinary aliases are valid call-shaped
+    Python syntax, so the same conservative visitor covers them without guessing alias names.
+    """
+    class _ExecutionCallVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name):
+                name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            else:
+                name = ""
+            if name not in _INERT_DATA_CALL_NAMES:
+                if name in _SCRIPT_EXECUTION_CALL_NAMES:
+                    self.paths.extend(_iter_call_argv_paths(node))
+                elif node.args:
+                    # Unknown calls may be execution aliases. Model their direct argv while keeping
+                    # nested data constructors inert (runtime_config(Path(ledger))).
+                    self.paths.extend(_iter_call_argv_paths(node, allow_path_constructor=False))
+            self.generic_visit(node)
+
+    for line in command.replace("\\\n", "").splitlines():
+        try:
+            tree = ast.parse(line)
+        except SyntaxError:
+            continue
+        visitor = _ExecutionCallVisitor()
+        visitor.visit(tree)
+        for candidate in visitor.paths:
+            yield from _resolved_or_nothing(candidate, cwd)
+
+
 def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
     """Yield paths that command semantics execute directly or through a POSIX shell. Each segment
     is read at the original token AND at the peeled wrapper target — additive on purpose: peeling
     must never REMOVE a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+    yield from _iter_source_call_script_paths(command, cwd=cwd)
     for segment in _iter_script_execution_segments(command):
         index = _command_token_index(segment)
         if index is None:
