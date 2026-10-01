@@ -350,6 +350,18 @@ _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
 
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+# Non-shell source can appear in a guarded command (notably Python heredocs). Parentheses in
+# ``Path('/state/ledger.jsonl')`` are call syntax, not shell command boundaries; only known APIs
+# that execute their argument make the parenthesized path an executable-script reference.
+_SCRIPT_EXECUTION_CALL_NAMES = frozenset({
+    "system", "popen", "run", "call", "Popen", "check_call", "check_output",
+    "getoutput", "getstatusoutput", "exec", "eval",
+})
+_SHELL_COMPOUND_PREFIXES = frozenset({
+    "if", "while", "until", "!", "then", "else", "elif", "do", "time", "coproc", "{",
+    "function",
+})
+
 # Bound the walk: a pathological token run must not spin here.
 _MAX_PREFIX_PEELS = 8
 
@@ -914,11 +926,80 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
         yield from _resolved_or_nothing(executable, cwd)
 
 
+def _iter_script_execution_segments(command: str) -> Iterator[list[str]]:
+    """Yield only segments whose first word has shell/script execution semantics.
+
+    ``shlex`` emits parentheses as control tokens even when scanning non-shell source embedded in a
+    command. Treating every post-``(`` token as a fresh command made ordinary calls such as
+    ``Path('/state/ledger.jsonl')`` execute the ledger in the guard's model. A parenthesis opens an
+    executable context only at a shell command position, after ``$`` command substitution, or after
+    an explicitly execution-bearing call.
+    """
+    for line in _split_logical_lines(command.replace("\\\n", "")):
+        try:
+            tokens = _shlex_tokens(line)
+        except ValueError:
+            for physical_line in line.splitlines():
+                try:
+                    tokens = _shlex_tokens(physical_line)
+                except ValueError:
+                    continue
+                yield from _script_execution_segments_from_tokens(tokens)
+            continue
+        yield from _script_execution_segments_from_tokens(tokens)
+
+
+def _is_script_execution_call(token: str) -> bool:
+    """Conservatively recognize Python APIs whose call arguments can become executed code."""
+    name = token.rsplit(".", 1)[-1]
+    return (
+        name in _SCRIPT_EXECUTION_CALL_NAMES
+        or name.startswith(("run", "exec"))
+        or "spawn" in name
+        or name == "startfile"
+        or "subprocess" in name
+    )
+
+
+def _script_execution_segments_from_tokens(tokens: list[str]) -> Iterator[list[str]]:
+    command_position = True
+    previous_segment: Optional[list[str]] = None
+    execution_parentheses: list[bool] = []
+    for segment in _split_segments(tokens, keep_controls=True):
+        if segment[0] and set(segment[0]) <= _CONTROL_CHARS:
+            for control in segment[0]:
+                if control in ";&|":
+                    command_position = True
+                elif control == "(":
+                    previous_name = previous_segment[-1] if previous_segment else ""
+                    previous_command = previous_segment[0] if previous_segment else ""
+                    command_position = (
+                        command_position
+                        or (execution_parentheses[-1] if execution_parentheses else False)
+                        or previous_name.endswith(("$", "<", ">", "`"))
+                        or _is_script_execution_call(previous_name)
+                        or previous_command in _SHELL_COMPOUND_PREFIXES
+                    )
+                    execution_parentheses.append(command_position)
+                elif control == ")":
+                    if execution_parentheses:
+                        execution_parentheses.pop()
+                    # A case arm (`pattern) command`) starts a command after the close. For a
+                    # non-executing language call this only exposes trailing syntax, not its data
+                    # arguments; another call parenthesis is classified afresh above.
+                    command_position = True
+            continue
+        if command_position:
+            yield segment
+        previous_segment = segment
+        command_position = False
+
+
 def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
-    for segment in _iter_command_segments(command):
+    """Yield paths that command semantics execute directly or through a POSIX shell. Each segment
+    is read at the original token AND at the peeled wrapper target — additive on purpose: peeling
+    must never REMOVE a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+    for segment in _iter_script_execution_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue

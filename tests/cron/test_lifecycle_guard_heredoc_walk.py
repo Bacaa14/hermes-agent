@@ -53,9 +53,9 @@ def test_inert_heredoc_body_script_path_still_read(tmp_path):
 
 
 def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, monkeypatch):
-    """A file only MENTIONED in an inert body may exhaust the text budget (one >64 KiB line), pull
-    in 64+ remote-read misses (a markdown table of paths) or be a live SQLite database: each is
-    "nothing to scan", never a block (#113944). The same file *executed* still fails closed."""
+    """A file only MENTIONED in an inert body is not an executed script: oversized text, remote-looking
+    paths and a live SQLite database are all ignored rather than scanned or blocked (#113944). The same
+    file *executed* still fails closed."""
     import cron.lifecycle_guard as lifecycle_guard
     from hermes_cli.sqlite_safe_read import connect_tracked
 
@@ -76,7 +76,7 @@ def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, m
         for data in (minified, notes, db):
             command = f"cd {tmp_path} && python3 - <<'PY'\nt = open('{data}', encoding='utf-8').read()\nPY"
             assert guard(command, cwd=str(tmp_path), read_remote_script=remote) is False, data.name
-        assert remote_misses  # the notes table was walked and its misses were bounded, not fatal
+        assert remote_misses == []  # data literals never become backend script reads
         unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {minified}")
         assert unsafe is True and "budget" in refusal
         unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(f"bash {db}")
