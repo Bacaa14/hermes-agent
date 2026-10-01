@@ -10,6 +10,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 from __future__ import annotations
 
 import ast
+import codeop
 import logging
 import os
 import re
@@ -1008,33 +1009,70 @@ def _script_execution_segments_from_tokens(tokens: list[str]) -> Iterator[list[s
         command_position = False
 
 
-def _literal_call_path(node: ast.AST, *, allow_path_constructor: bool) -> Optional[str]:
+def _literal_call_path(
+    node: ast.AST, *, allow_path_constructor: bool,
+    is_inert_call: Callable[[ast.expr], bool],
+) -> Optional[str]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if (
         allow_path_constructor
         and isinstance(node, ast.Call)
         and node.args
-        and isinstance(node.func, (ast.Name, ast.Attribute))
+        and is_inert_call(node.func)
     ):
-        name = node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+        name = (
+            node.func.id if isinstance(node.func, ast.Name)
+            else node.func.attr if isinstance(node.func, ast.Attribute)
+            else ""
+        )
         if name in _PATH_CONSTRUCTOR_CALL_NAMES:
-            return _literal_call_path(node.args[0], allow_path_constructor=False)
+            return _literal_call_path(
+                node.args[0], allow_path_constructor=False, is_inert_call=is_inert_call,
+            )
     return None
 
 
-def _iter_call_argv_paths(call: ast.Call, *, allow_path_constructor: bool = True) -> Iterator[str]:
+def _iter_call_argv_paths(
+    call: ast.Call, *, is_inert_call: Callable[[ast.expr], bool],
+    allow_path_constructor: bool = True,
+    keyword_names: frozenset[str] = frozenset({"args", "command", "cmd"}),
+) -> Iterator[str]:
     """Yield only argv entries that execution semantics can interpret as scripts."""
-    if not call.args:
+    for keyword in call.keywords:
+        if keyword.arg == "executable":
+            executable = _literal_call_path(
+                keyword.value,
+                allow_path_constructor=allow_path_constructor,
+                is_inert_call=is_inert_call,
+            )
+            if executable is not None:
+                yield executable
+    command: Optional[ast.AST] = call.args[0] if call.args else None
+    if command is None:
+        command = next(
+            (keyword.value for keyword in call.keywords
+             if keyword.arg in keyword_names),
+            None,
+        )
+    if command is None:
         return
-    command = call.args[0]
-    direct = _literal_call_path(command, allow_path_constructor=allow_path_constructor)
+    direct = _literal_call_path(
+        command,
+        allow_path_constructor=allow_path_constructor,
+        is_inert_call=is_inert_call,
+    )
     if direct is not None:
         yield direct
         return
     if not isinstance(command, (ast.List, ast.Tuple)) or not command.elts:
         return
-    argv = [_literal_call_path(item, allow_path_constructor=False) for item in command.elts]
+    argv = [
+        _literal_call_path(
+            item, allow_path_constructor=False, is_inert_call=is_inert_call,
+        )
+        for item in command.elts
+    ]
     executable = argv[0]
     if executable is None:
         return
@@ -1053,16 +1091,341 @@ def _iter_call_argv_paths(call: ast.Call, *, allow_path_constructor: bool = True
             return
 
 
+def _iter_python_source_trees(command: str) -> Iterator[ast.Module]:
+    """Yield complete Python source blocks, including blocks embedded in shell heredocs.
+
+    A whole valid source string stays one tree so bindings are ordered normally. If shell framing
+    makes that impossible, ``compile_command`` accumulates complete statements instead of parsing
+    physical lines and therefore retains multiline calls.
+    """
+    try:
+        yield ast.parse(command)
+        return
+    except SyntaxError:
+        pass
+
+    # Shell framing is not Python, but each complete heredoc body can be. Parse the body as one
+    # block before the statement fallback so compound suites and multiline calls stay intact.
+    lines = command.splitlines()
+    for index, line in enumerate(lines):
+        match = re.search(
+            r"<<(?P<tabs>-)?\s*(?:'(?P<single>[^']+)'|\"(?P<double>[^\"]+)\"|"
+            r"(?P<bare>[A-Za-z_][A-Za-z0-9_]*))(?=\s|[;&|<>#]|$)",
+            line,
+        )
+        if match is None:
+            continue
+        delimiter = match.group("single") or match.group("double") or match.group("bare")
+        body: list[str] = []
+        for candidate in lines[index + 1:]:
+            terminator = candidate.lstrip("\t") if match.group("tabs") else candidate
+            if terminator == delimiter:
+                try:
+                    yield ast.parse("\n".join(body))
+                except SyntaxError:
+                    pass
+                break
+            body.append(candidate)
+
+    pending = ""
+    for line in command.splitlines(keepends=True):
+        pending += line
+        try:
+            complete = codeop.compile_command(pending, symbol="exec")
+        except (OverflowError, SyntaxError, ValueError):
+            pending = ""
+            continue
+        if complete is None:
+            continue
+        try:
+            yield ast.parse(pending)
+        except SyntaxError:
+            pass
+        pending = ""
+
+
 def _iter_source_call_script_paths(command: str, *, cwd: Optional[str]) -> Iterator[Path]:
     """Model executable argument positions in Python/JavaScript-shaped call expressions.
 
-    Each physical line is parsed independently because interpreter heredoc framing is shell, not
-    Python. JavaScript ``require('x')``/``load('x')`` and ordinary aliases are valid call-shaped
-    Python syntax, so the same conservative visitor covers them without guessing alias names.
+    Complete Python blocks are parsed structurally. JavaScript ``require('x')``/``load('x')`` and
+    ordinary aliases are valid call-shaped Python syntax, so the same conservative visitor covers
+    them without guessing alias names.
     """
+    trees = list(_iter_python_source_trees(command.replace("\\\n", "")))
+    inert_names = set(_INERT_DATA_CALL_NAMES)
+    pathlib_aliases: set[str] = set()
+    data_module_aliases: set[str] = set()
+    for tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    bound = alias.asname or alias.name.split(".", 1)[0]
+                    if alias.name == "pathlib":
+                        pathlib_aliases.add(bound)
+                    elif alias.name in {"builtins", "io"}:
+                        data_module_aliases.add(bound)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    bound = alias.asname or alias.name
+                    if node.module == "pathlib" and alias.name in _PATH_CONSTRUCTOR_CALL_NAMES:
+                        inert_names.add(bound)
+                    elif node.module in {"builtins", "io"} and alias.name == "open":
+                        inert_names.add(bound)
+
+    def statically_inert(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in inert_names and node.id not in tainted_names
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id not in tainted_names
+            and (node.value.id, node.attr) not in tainted_attributes
+            and (
+                (node.value.id in pathlib_aliases and node.attr in _PATH_CONSTRUCTOR_CALL_NAMES)
+                or (node.value.id in data_module_aliases and node.attr == "open")
+            )
+        )
+
+    tainted_names: set[str] = set()
+    tainted_attributes: set[tuple[str, str]] = set()
+
+    class _BindingCollector(ast.NodeVisitor):
+        """Collect every ambiguous rebind before calls are classified.
+
+        Python globals are resolved when a function runs, and branch/loop bodies may not execute.
+        A source-wide taint is deliberately conservative: once a proven-data name can denote
+        something else anywhere in the block, lexical spelling cannot exempt it.
+        """
+
+        def _target(self, node: ast.AST, *, inert: bool = False) -> None:
+            if isinstance(node, ast.Name):
+                if inert:
+                    inert_names.add(node.id)
+                else:
+                    tainted_names.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                tainted_attributes.add((node.value.id, node.attr))
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for item in node.elts:
+                    self._target(item)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            inert = statically_inert(node.value)
+            for target in node.targets:
+                self._target(target, inert=inert)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                self._target(node.target, inert=statically_inert(node.value))
+                self.visit(node.value)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self._target(node.target)
+            self.visit(node.value)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self._target(node.target, inert=statically_inert(node.value))
+            self.visit(node.value)
+
+        def visit_For(self, node: ast.For) -> None:
+            self._target(node.target)
+            self.generic_visit(node)
+
+        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+            self._target(node.target)
+            self.generic_visit(node)
+
+        def visit_comprehension(self, node: ast.comprehension) -> None:
+            self._target(node.target)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._target(ast.Name(id=node.name))
+            for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+                if expression is not None:
+                    self.visit(expression)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._target(ast.Name(id=node.name))
+            for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+                if expression is not None:
+                    self.visit(expression)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self._target(ast.Name(id=node.name))
+            self.generic_visit(node)
+
+        def visit_With(self, node: ast.With) -> None:
+            for item in node.items:
+                if item.optional_vars is not None:
+                    self._target(item.optional_vars)
+            self.generic_visit(node)
+
+        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+            for item in node.items:
+                if item.optional_vars is not None:
+                    self._target(item.optional_vars)
+            self.generic_visit(node)
+
+        def visit_MatchAs(self, node: ast.MatchAs) -> None:
+            if node.name is not None:
+                self._target(ast.Name(id=node.name))
+            self.generic_visit(node)
+
+        def visit_MatchStar(self, node: ast.MatchStar) -> None:
+            if node.name is not None:
+                self._target(ast.Name(id=node.name))
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.name is not None:
+                self._target(ast.Name(id=node.name))
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                if alias.name not in {"pathlib", "builtins", "io"}:
+                    self._target(ast.Name(id=bound))
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                safe = (
+                    (node.module == "pathlib" and alias.name in _PATH_CONSTRUCTOR_CALL_NAMES)
+                    or (node.module in {"builtins", "io"} and alias.name == "open")
+                )
+                if not safe:
+                    self._target(ast.Name(id=alias.asname or alias.name))
+
+    collector = _BindingCollector()
+    for tree in trees:
+        collector.visit(tree)
+
+    # Resolve aliases after all module bindings are known. This closes deferred forms such as
+    # ``open = Path`` before a later ``Path = subprocess.run``.
+    changed = True
+    while changed:
+        changed = False
+        for tree in trees:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.Assign, ast.NamedExpr)):
+                    continue
+                value = node.value
+                source_tainted = (
+                    isinstance(value, ast.Name) and value.id in tainted_names
+                    or isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)
+                    and (
+                        value.value.id in tainted_names
+                        or (value.value.id, value.attr) in tainted_attributes
+                    )
+                )
+                if not source_tainted:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in tainted_names:
+                        tainted_names.add(target.id)
+                        changed = True
+
     class _ExecutionCallVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.paths: list[str] = []
+            self.inert_names = set(inert_names)
+            self.pathlib_aliases = set(pathlib_aliases)
+            self.data_module_aliases = set(data_module_aliases)
+            self.local_taints: list[set[str]] = []
+
+        def _is_inert_call(self, node: ast.expr) -> bool:
+            if isinstance(node, ast.Name):
+                return (
+                    node.id in self.inert_names
+                    and node.id not in tainted_names
+                    and not any(node.id in names for names in self.local_taints)
+                )
+            return (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id not in tainted_names
+                and (node.value.id, node.attr) not in tainted_attributes
+                and (
+                    (node.value.id in self.pathlib_aliases
+                     and node.attr in _PATH_CONSTRUCTOR_CALL_NAMES)
+                    or (node.value.id in self.data_module_aliases and node.attr == "open")
+                )
+            )
+
+        @staticmethod
+        def _argument_names(arguments: ast.arguments) -> set[str]:
+            names = {
+                argument.arg
+                for argument in [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+            }
+            if arguments.vararg is not None:
+                names.add(arguments.vararg.arg)
+            if arguments.kwarg is not None:
+                names.add(arguments.kwarg.arg)
+            return names
+
+        def _visit_function_body(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+                if expression is not None:
+                    self.visit(expression)
+            self.local_taints.append(self._argument_names(node.args))
+            for statement in node.body:
+                self.visit(statement)
+            self.local_taints.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function_body(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function_body(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self.local_taints.append(self._argument_names(node.args))
+            self.visit(node.body)
+            self.local_taints.pop()
+
+        def _taint_local_target(self, node: ast.AST) -> None:
+            if not self.local_taints:
+                return
+            if isinstance(node, ast.Name):
+                self.local_taints[-1].add(node.id)
+            elif isinstance(node, (ast.Tuple, ast.List)):
+                for item in node.elts:
+                    self._taint_local_target(item)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            local_source = (
+                isinstance(node.value, ast.Name)
+                and any(node.value.id in names for names in self.local_taints)
+            )
+            if self.local_taints and (local_source or not statically_inert(node.value)):
+                for target in node.targets:
+                    self._taint_local_target(target)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                if self.local_taints and not statically_inert(node.value):
+                    self._taint_local_target(node.target)
+                self.visit(node.value)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            if self.local_taints and not statically_inert(node.value):
+                self._taint_local_target(node.target)
+            self.visit(node.value)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            if not self.local_taints:
+                return
+            for alias in node.names:
+                safe = (
+                    (node.module == "pathlib" and alias.name in _PATH_CONSTRUCTOR_CALL_NAMES)
+                    or (node.module in {"builtins", "io"} and alias.name == "open")
+                )
+                if not safe:
+                    self.local_taints[-1].add(alias.asname or alias.name)
 
         def visit_Call(self, node: ast.Call) -> None:
             if isinstance(node.func, ast.Name):
@@ -1071,24 +1434,47 @@ def _iter_source_call_script_paths(command: str, *, cwd: Optional[str]) -> Itera
                 name = node.func.attr
             else:
                 name = ""
-            if name not in _INERT_DATA_CALL_NAMES:
+            if not self._is_inert_call(node.func):
                 if name in _SCRIPT_EXECUTION_CALL_NAMES:
-                    self.paths.extend(_iter_call_argv_paths(node))
-                elif node.args:
+                    self.paths.extend(
+                        _iter_call_argv_paths(
+                            node,
+                            is_inert_call=self._is_inert_call,
+                            keyword_names=frozenset({
+                                "args", "command", "cmd", "path", "path_name", "file", "program",
+                            }),
+                        )
+                    )
+                elif node.args or node.keywords:
                     # Unknown calls may be execution aliases. Model their direct argv while keeping
                     # nested data constructors inert (runtime_config(Path(ledger))).
-                    self.paths.extend(_iter_call_argv_paths(node, allow_path_constructor=False))
+                    self.paths.extend(
+                        _iter_call_argv_paths(
+                            node,
+                            is_inert_call=self._is_inert_call,
+                            allow_path_constructor=False,
+                            keyword_names=(
+                                frozenset({
+                                    "args", "command", "cmd", "path", "path_name", "file", "program",
+                                })
+                                if (
+                                    (isinstance(node.func, ast.Name)
+                                     and node.func.id in tainted_names)
+                                    or (isinstance(node.func, ast.Attribute)
+                                        and isinstance(node.func.value, ast.Name)
+                                        and (node.func.value.id, node.func.attr) in tainted_attributes)
+                                )
+                                else frozenset({"args", "command", "cmd"})
+                            ),
+                        )
+                    )
             self.generic_visit(node)
 
-    for line in command.replace("\\\n", "").splitlines():
-        try:
-            tree = ast.parse(line)
-        except SyntaxError:
-            continue
-        visitor = _ExecutionCallVisitor()
+    visitor = _ExecutionCallVisitor()
+    for tree in trees:
         visitor.visit(tree)
-        for candidate in visitor.paths:
-            yield from _resolved_or_nothing(candidate, cwd)
+    for candidate in visitor.paths:
+        yield from _resolved_or_nothing(candidate, cwd)
 
 
 def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
